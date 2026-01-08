@@ -53,6 +53,17 @@ Uninstall:
 ralph loop "Build a REST API for todos" --completion-promise "DONE" --max-iterations 20
 ```
 
+Important: If you set `--completion-promise`, your prompt MUST instruct Codex to
+output the exact `<promise>...</promise>` tag only when the completion criteria
+are fully satisfied. Ralph does not add this instruction for you.
+
+Example prompt snippet:
+
+```
+When complete, output EXACTLY:
+<promise>DONE</promise>
+```
+
 Pass Codex flags after `--`:
 
 ```bash
