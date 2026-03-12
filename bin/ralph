@@ -5,6 +5,7 @@ set -euo pipefail
 STATE_DIR=".codex"
 STATE_FILE="$STATE_DIR/ralph-loop.local.md"
 LAST_MESSAGE_FILE="$STATE_DIR/ralph-last-message.txt"
+PROMPT_RESPONSE=""
 
 err() {
   echo "ERROR: $*" >&2
@@ -28,19 +29,21 @@ usage() {
 Ralph Wiggum for Codex
 
 Usage:
-  ralph loop [PROMPT...] [--max-iterations N] [--completion-promise TEXT] [--] [codex exec args]
+  ralph loop [PROMPT...] [--max-iterations N] [--max-timeout-seconds N] [--completion-promise TEXT] [--] [codex exec args]
   ralph cancel
   ralph status
   ralph help
 
 Notes:
-  - PROMPT can be omitted if provided via stdin (multi-line supported).
-  - Use -- to pass flags directly to `codex exec` (e.g., -- --model o3).
+  - `ralph loop` with no prompt on a TTY asks for a prompt, then starts the loop.
+  - PROMPT can also be provided via stdin (multi-line supported).
+  - Pass Codex flags after -- (e.g., -- --model o3).
 
 Examples:
   ralph loop Build a todo API --completion-promise "DONE" --max-iterations 20
   ralph loop --max-iterations 10 Fix auth bug -- --model o3
   cat PROMPT.md | ralph loop --completion-promise "OK" -- --sandbox workspace-write
+  ralph loop
 USAGE
 }
 
@@ -49,15 +52,17 @@ loop_help() {
 ralph loop
 
 Usage:
-  ralph loop [PROMPT...] [--max-iterations N] [--completion-promise TEXT] [--] [codex exec args]
+  ralph loop [PROMPT...] [--max-iterations N] [--max-timeout-seconds N] [--completion-promise TEXT] [--] [codex exec args]
 
 Options:
   --max-iterations N        Max iterations before auto-stop (default: unlimited)
+  --max-timeout-seconds N   Wall-clock timeout in seconds (default: none)
   --completion-promise TEXT Promise phrase; stop when <promise>TEXT</promise> appears
   -h, --help                Show this help
 
 Notes:
-  - PROMPT can be provided via stdin if omitted (multi-line supported).
+  - `ralph loop` with no prompt on a TTY asks for a prompt.
+  - PROMPT can be provided via stdin if omitted.
   - Pass Codex flags after -- (e.g., -- --model o3 --sandbox workspace-write).
 USAGE
 }
@@ -66,9 +71,9 @@ read_frontmatter_value() {
   local key="$1"
   local value
   value=$(awk -v k="$key" '
-    BEGIN {in=0}
-    /^---$/ {in=!in; next}
-    in && $0 ~ "^" k ":" {
+    BEGIN {inside=0}
+    /^---$/ {inside=!inside; next}
+    inside && $0 ~ "^" k ":" {
       sub("^[^:]*: *", "", $0)
       print $0
       exit
@@ -79,19 +84,45 @@ read_frontmatter_value() {
   printf '%s' "$value"
 }
 
+yaml_quote() {
+  local value="$1"
+  value=${value//\\/\\\\}
+  value=${value//\"/\\\"}
+  printf '"%s"' "$value"
+}
+
+yaml_number_or_null() {
+  local value="$1"
+  if [[ "$value" -gt 0 ]]; then
+    printf '%s' "$value"
+  else
+    printf 'null'
+  fi
+}
+
+serialize_codex_args() {
+  local result=""
+  if [[ $# -gt 0 ]]; then
+    result=$(printf '%q ' "$@")
+    result=${result% }
+  fi
+  printf '%s' "$result"
+}
+
 write_state_file() {
   local prompt="$1"
   local max_iterations="$2"
-  local completion_promise="$3"
-  local codex_args_serialized="$4"
+  local max_timeout_seconds="$3"
+  local completion_promise="$4"
+  local codex_args_serialized="$5"
   local completion_yaml="null"
   local codex_args_yaml="null"
 
   if [[ -n "$completion_promise" ]]; then
-    completion_yaml="\"$completion_promise\""
+    completion_yaml=$(yaml_quote "$completion_promise")
   fi
   if [[ -n "$codex_args_serialized" ]]; then
-    codex_args_yaml="\"$codex_args_serialized\""
+    codex_args_yaml=$(yaml_quote "$codex_args_serialized")
   fi
 
   mkdir -p "$STATE_DIR"
@@ -100,7 +131,8 @@ write_state_file() {
 ---
 active: true
 iteration: 1
-max_iterations: $max_iterations
+max_iterations: $(yaml_number_or_null "$max_iterations")
+max_timeout_seconds: $(yaml_number_or_null "$max_timeout_seconds")
 completion_promise: $completion_yaml
 codex_args: $codex_args_yaml
 started_at: "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -123,6 +155,7 @@ extract_promise_text() {
   python3 - "$file" <<'PY'
 import re
 import sys
+
 path = sys.argv[1]
 try:
     text = open(path, 'r', encoding='utf-8', errors='ignore').read()
@@ -137,9 +170,124 @@ print(value)
 PY
 }
 
+display_limit() {
+  local value="$1"
+  local empty_label="$2"
+  if [[ -z "$value" || "$value" == "null" ]]; then
+    printf '%s' "$empty_label"
+  else
+    printf '%s' "$value"
+  fi
+}
+
+validate_codex_args() {
+  local arg
+  for arg in "$@"; do
+    case "$arg" in
+      --output-last-message|--output-last-message=*|-o)
+        die "Do not pass --output-last-message/-o; Ralph uses it internally"
+        ;;
+    esac
+  done
+}
+
+prompt_for_prompt() {
+  while true; do
+    printf 'Enter the prompt Ralph should run. Finish with Ctrl-D on a new line.\n'
+    if ! PROMPT_RESPONSE=$(cat); then
+      return 1
+    fi
+    if [[ -n "$PROMPT_RESPONSE" ]]; then
+      return 0
+    fi
+    warn "Prompt required."
+  done
+}
+
+run_loop() {
+  local prompt="$1"
+  local max_iterations="$2"
+  local max_timeout_seconds="$3"
+  local completion_promise="$4"
+  shift 4
+  local -a codex_args=("$@")
+  local codex_args_serialized=""
+  local iteration=1
+  local promise_text=""
+  local start_epoch now elapsed
+
+  require_cmd codex
+  require_cmd python3
+  validate_codex_args "${codex_args[@]}"
+
+  codex_args_serialized=$(serialize_codex_args "${codex_args[@]}")
+  write_state_file "$prompt" "$max_iterations" "$max_timeout_seconds" "$completion_promise" "$codex_args_serialized"
+
+  start_epoch=$(date +%s)
+
+  while true; do
+    if [[ ! -f "$STATE_FILE" ]]; then
+      echo "Ralph loop cancelled."
+      return 0
+    fi
+
+    if [[ "$max_timeout_seconds" -gt 0 ]]; then
+      now=$(date +%s)
+      elapsed=$((now - start_epoch))
+      if [[ "$elapsed" -ge "$max_timeout_seconds" ]]; then
+        echo "Ralph loop: max timeout reached (${max_timeout_seconds} seconds)."
+        rm -f "$STATE_FILE"
+        return 0
+      fi
+    fi
+
+    echo "Ralph iteration $iteration"
+    mkdir -p "$STATE_DIR"
+
+    if ! printf '%s\n' "$prompt" | codex exec "${codex_args[@]}" --output-last-message "$LAST_MESSAGE_FILE"; then
+      warn "codex exec failed; stopping Ralph loop"
+      rm -f "$STATE_FILE"
+      return 1
+    fi
+
+    if [[ ! -f "$LAST_MESSAGE_FILE" ]]; then
+      warn "codex exec did not write last message file; stopping Ralph loop"
+      rm -f "$STATE_FILE"
+      return 1
+    fi
+
+    if [[ -n "$completion_promise" ]]; then
+      promise_text=""
+      if promise_text=$(extract_promise_text "$LAST_MESSAGE_FILE" 2>/dev/null); then
+        if [[ "$promise_text" == "$completion_promise" ]]; then
+          echo "Ralph loop complete: <promise>$completion_promise</promise>"
+          rm -f "$STATE_FILE"
+          return 0
+        fi
+      fi
+    fi
+
+    if [[ ! -f "$STATE_FILE" ]]; then
+      echo "Ralph loop cancelled."
+      return 0
+    fi
+
+    if [[ "$max_iterations" -gt 0 && "$iteration" -ge "$max_iterations" ]]; then
+      echo "Ralph loop: max iterations reached ($max_iterations)."
+      rm -f "$STATE_FILE"
+      return 0
+    fi
+
+    iteration=$((iteration + 1))
+    update_iteration "$iteration"
+  done
+}
+
 cmd_loop() {
   local max_iterations=0
+  local max_timeout_seconds=0
   local completion_promise=""
+  local prompt=""
   local -a prompt_parts=()
   local -a codex_args=()
 
@@ -149,6 +297,12 @@ cmd_loop() {
         [[ -n "${2:-}" ]] || die "--max-iterations requires a number"
         [[ "$2" =~ ^[0-9]+$ ]] || die "--max-iterations must be a non-negative integer"
         max_iterations="$2"
+        shift 2
+        ;;
+      --max-timeout-seconds)
+        [[ -n "${2:-}" ]] || die "--max-timeout-seconds requires a number"
+        [[ "$2" =~ ^[0-9]+$ ]] || die "--max-timeout-seconds must be a non-negative integer"
+        max_timeout_seconds="$2"
         shift 2
         ;;
       --completion-promise)
@@ -172,85 +326,24 @@ cmd_loop() {
     esac
   done
 
-  local prompt="${prompt_parts[*]}"
-  if [[ -z "$prompt" && ! -t 0 ]]; then
-    prompt="$(cat)"
+  prompt="${prompt_parts[*]}"
+  if [[ -z "$prompt" ]]; then
+    if [[ ! -t 0 ]]; then
+      prompt="$(cat)"
+    else
+      prompt_for_prompt || die "No prompt provided"
+      prompt="$PROMPT_RESPONSE"
+    fi
   fi
 
-  [[ -n "$prompt" ]] || die "No prompt provided (pass PROMPT args or pipe via stdin)"
-
-  require_cmd codex
-  require_cmd python3
-
-  for arg in "${codex_args[@]}"; do
-    if [[ "$arg" == "--output-last-message" || "$arg" == "-o" ]]; then
-      die "Do not pass --output-last-message/-o; Ralph uses it internally"
-    fi
-  done
-
-  local codex_args_serialized=""
-  if [[ ${#codex_args[@]} -gt 0 ]]; then
-    codex_args_serialized=$(printf '%q ' "${codex_args[@]}")
-    codex_args_serialized=${codex_args_serialized% }
-  fi
-
-  write_state_file "$prompt" "$max_iterations" "$completion_promise" "$codex_args_serialized"
-
-  local iteration=1
-
-  while true; do
-    if [[ ! -f "$STATE_FILE" ]]; then
-      echo "Ralph loop cancelled."
-      exit 0
-    fi
-
-    echo "Ralph iteration $iteration"
-
-    mkdir -p "$STATE_DIR"
-
-    if ! printf '%s\n' "$prompt" | codex exec "${codex_args[@]}" --output-last-message "$LAST_MESSAGE_FILE"; then
-      warn "codex exec failed; stopping Ralph loop"
-      rm -f "$STATE_FILE"
-      exit 1
-    fi
-
-    if [[ ! -f "$LAST_MESSAGE_FILE" ]]; then
-      warn "codex exec did not write last message file; stopping Ralph loop"
-      rm -f "$STATE_FILE"
-      exit 1
-    fi
-
-    if [[ -n "$completion_promise" ]]; then
-      local promise_text=""
-      if promise_text=$(extract_promise_text "$LAST_MESSAGE_FILE" 2>/dev/null); then
-        if [[ "$promise_text" == "$completion_promise" ]]; then
-          echo "Ralph loop complete: <promise>$completion_promise</promise>"
-          rm -f "$STATE_FILE"
-          exit 0
-        fi
-      fi
-    fi
-
-    if [[ ! -f "$STATE_FILE" ]]; then
-      echo "Ralph loop cancelled."
-      exit 0
-    fi
-
-    if [[ "$max_iterations" -gt 0 && "$iteration" -ge "$max_iterations" ]]; then
-      echo "Ralph loop: max iterations reached ($max_iterations)."
-      rm -f "$STATE_FILE"
-      exit 0
-    fi
-
-    iteration=$((iteration + 1))
-    update_iteration "$iteration"
-  done
+  [[ -n "$prompt" ]] || die "No prompt provided (pass PROMPT args, pipe via stdin, or answer the prompt)"
+  run_loop "$prompt" "$max_iterations" "$max_timeout_seconds" "$completion_promise" "${codex_args[@]}"
 }
 
 cmd_cancel() {
   if [[ ! -f "$STATE_FILE" ]]; then
     echo "No active Ralph loop found."
-    exit 0
+    return 0
   fi
 
   local iteration
@@ -266,19 +359,21 @@ cmd_cancel() {
 cmd_status() {
   if [[ ! -f "$STATE_FILE" ]]; then
     echo "No active Ralph loop found."
-    exit 0
+    return 0
   fi
 
-  local iteration max_iterations completion_promise started_at codex_args
+  local iteration max_iterations max_timeout_seconds completion_promise started_at codex_args
   iteration=$(read_frontmatter_value "iteration")
   max_iterations=$(read_frontmatter_value "max_iterations")
+  max_timeout_seconds=$(read_frontmatter_value "max_timeout_seconds")
   completion_promise=$(read_frontmatter_value "completion_promise")
   started_at=$(read_frontmatter_value "started_at")
   codex_args=$(read_frontmatter_value "codex_args")
 
   echo "Ralph loop active"
   echo "  iteration: ${iteration:-?}"
-  echo "  max_iterations: ${max_iterations:-?}"
+  echo "  max_iterations: $(display_limit "$max_iterations" "unlimited")"
+  echo "  max_timeout_seconds: $(display_limit "$max_timeout_seconds" "none")"
   echo "  completion_promise: ${completion_promise:-none}"
   echo "  started_at: ${started_at:-?}"
   if [[ -n "$codex_args" && "$codex_args" != "null" ]]; then
